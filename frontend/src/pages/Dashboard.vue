@@ -54,8 +54,33 @@ const maxCount = computed(() => {
             <div class="bar"><span :style="{ width: (data.未平隔离 / maxCount * 100) + '%' }"></span></div>
             <span class="v">{{ data.未平隔离 }}</span>
           </div>
+          <div class="meter-row">
+            <span class="n">死信</span>
+            <div class="bar"><span class="dead" :style="{ width: (data.死信 / maxCount * 100) + '%' }"></span></div>
+            <span class="v">{{ data.死信 }}</span>
+          </div>
         </div>
       </section>
+
+      <h2 class="section-title">隔离重试</h2>
+      <div class="stats">
+        <div class="stat">
+          <p class="k">冷却中</p>
+          <p class="v">{{ data.冷却中 }}</p>
+        </div>
+        <div class="stat">
+          <p class="k">死信</p>
+          <p class="v">{{ data.死信 }}</p>
+        </div>
+        <div class="stat">
+          <p class="k">重试成功</p>
+          <p class="v">{{ data.重试成功 }}</p>
+        </div>
+      </div>
+      <p class="note-strip">
+        隔离敞口 ¥ {{ yuan(data.隔离敞口分) }}（死信 ¥ {{ yuan(data.死信敞口分) }}）
+        · 余额与流水{{ data['余额与流水一致'] ? '一致' : '不一致' }}
+      </p>
 
       <h2 class="section-title">账户余额</h2>
       <div class="panel">

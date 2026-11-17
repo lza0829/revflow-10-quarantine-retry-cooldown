@@ -6,10 +6,34 @@ from datetime import datetime, timezone
 from fastapi import HTTPException
 
 from app.db import connect, rows_to_dicts
+from app.modules import quarantine_retry
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _quarantine(
+    conn,
+    *,
+    entry_key: str,
+    account_id: int,
+    reason: str,
+    amount_cents: int,
+    settle_run_id: int,
+    created_at: str,
+) -> int:
+    """隔离项与重试进度同一事务落库：重试次数/冷却从登记起就可查。"""
+    cur = conn.execute(
+        """
+        INSERT INTO quarantine_items(
+          entry_key, account_id, reason, amount_cents, settle_run_id, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (entry_key, account_id, reason, amount_cents, settle_run_id, created_at),
+    )
+    quarantine_retry.register_item(conn, cur.lastrowid, created_at)
+    return cur.lastrowid
 
 
 def dashboard() -> dict:
@@ -24,16 +48,25 @@ def dashboard() -> dict:
         pending = conn.execute(
             "SELECT COUNT(*) AS c FROM ledger_entries WHERE status = '待归并'"
         ).fetchone()["c"]
-        q = conn.execute("SELECT COUNT(*) AS c FROM quarantine_items").fetchone()["c"]
-        bal = conn.execute("SELECT COALESCE(SUM(balance_cents), 0) AS s FROM accounts").fetchone()["s"]
+        quarantine_retry.backfill_state(conn)
+        retry_stats = quarantine_retry.stats_for_conn(conn)
+        bal = retry_stats["account_balance_cents"]
         last = conn.execute("SELECT * FROM settle_runs ORDER BY id DESC LIMIT 1").fetchone()
         return {
             "账户数": len(accounts),
             "正向笔数": fwd,
             "冲正笔数": rev,
             "待归并": pending,
-            "未平隔离": q,
+            "未平隔离": retry_stats["open_count"],
+            "冷却中": retry_stats["cooldown_count"],
+            "可重试": retry_stats["ready_count"],
+            "死信": retry_stats["dead_letter_count"],
+            "重试成功": retry_stats["retry_success_count"],
+            "隔离敞口分": retry_stats["quarantine_exposure_cents"],
+            "死信敞口分": retry_stats["dead_letter_exposure_cents"],
             "余额合计分": bal,
+            "余额与流水一致": retry_stats["consistent"],
+            "重试统计": retry_stats,
             "最近归并": dict(last) if last else None,
             "账户": accounts,
         }
@@ -70,16 +103,7 @@ def list_entries(kind: str | None = None) -> list[dict]:
 
 
 def list_quarantine() -> list[dict]:
-    with connect() as conn:
-        rows = conn.execute(
-            """
-            SELECT q.*, a.code AS account_code
-            FROM quarantine_items q
-            JOIN accounts a ON a.id = q.account_id
-            ORDER BY q.id DESC
-            """
-        ).fetchall()
-        return rows_to_dicts(rows)
+    return quarantine_retry.list_items()
 
 
 def list_settle_runs() -> list[dict]:
@@ -133,13 +157,14 @@ def run_settle() -> dict:
         for r in reversals:
             target = r.get("target_entry_key")
             if not target or target not in fwd_by_key:
-                conn.execute(
-                    """
-                    INSERT INTO quarantine_items(
-                      entry_key, account_id, reason, amount_cents, settle_run_id, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (r["entry_key"], r["account_id"], "冲正无原单", r["amount_cents"], run_id, now),
+                _quarantine(
+                    conn,
+                    entry_key=r["entry_key"],
+                    account_id=r["account_id"],
+                    reason="冲正无原单",
+                    amount_cents=r["amount_cents"],
+                    settle_run_id=run_id,
+                    created_at=now,
                 )
                 conn.execute(
                     "UPDATE ledger_entries SET status = '已隔离', settle_run_id = ? WHERE id = ?",
@@ -150,13 +175,14 @@ def run_settle() -> dict:
 
             fwd = fwd_by_key[target]
             if fwd["account_id"] != r["account_id"]:
-                conn.execute(
-                    """
-                    INSERT INTO quarantine_items(
-                      entry_key, account_id, reason, amount_cents, settle_run_id, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (r["entry_key"], r["account_id"], "冲正账户与原单不一致", r["amount_cents"], run_id, now),
+                _quarantine(
+                    conn,
+                    entry_key=r["entry_key"],
+                    account_id=r["account_id"],
+                    reason="冲正账户与原单不一致",
+                    amount_cents=r["amount_cents"],
+                    settle_run_id=run_id,
+                    created_at=now,
                 )
                 conn.execute(
                     "UPDATE ledger_entries SET status = '已隔离', settle_run_id = ? WHERE id = ?",
@@ -167,13 +193,14 @@ def run_settle() -> dict:
 
             remain = fwd["amount_cents"] - used[target]
             if r["amount_cents"] > remain:
-                conn.execute(
-                    """
-                    INSERT INTO quarantine_items(
-                      entry_key, account_id, reason, amount_cents, settle_run_id, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (r["entry_key"], r["account_id"], "冲正超额", r["amount_cents"], run_id, now),
+                _quarantine(
+                    conn,
+                    entry_key=r["entry_key"],
+                    account_id=r["account_id"],
+                    reason="冲正超额",
+                    amount_cents=r["amount_cents"],
+                    settle_run_id=run_id,
+                    created_at=now,
                 )
                 conn.execute(
                     "UPDATE ledger_entries SET status = '已隔离', settle_run_id = ? WHERE id = ?",
@@ -197,15 +224,41 @@ def run_settle() -> dict:
             )
             settled += 1
 
-        net_total = 0
-        for acc_id, net in account_net.items():
-            conn.execute(
-                "UPDATE accounts SET balance_cents = ?, last_settle_run_id = ? WHERE id = ?",
-                (net, run_id, acc_id),
-            )
-            net_total += net
+        # 余额按「全部已归并流水」重算，而不是只按本轮待归并：
+        # 隔离重试成功会补记已归并流水，重跑归并不能把它抹掉。
+        account_ids = [
+            r["id"] for r in conn.execute("SELECT id FROM accounts ORDER BY id").fetchall()
+        ]
+        for acc_id in account_ids:
+            merged_fwd = conn.execute(
+                """
+                SELECT COALESCE(SUM(amount_cents), 0) AS s FROM ledger_entries
+                WHERE account_id = ? AND kind = '正向' AND status = '已归并'
+                """,
+                (acc_id,),
+            ).fetchone()["s"]
+            merged_rev = conn.execute(
+                """
+                SELECT COALESCE(SUM(amount_cents), 0) AS s FROM ledger_entries
+                WHERE account_id = ? AND kind = '冲正' AND status = '已归并'
+                """,
+                (acc_id,),
+            ).fetchone()["s"]
+            balance = merged_fwd - merged_rev
+            if acc_id in account_net:
+                conn.execute(
+                    "UPDATE accounts SET balance_cents = ?, last_settle_run_id = ? WHERE id = ?",
+                    (balance, run_id, acc_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE accounts SET balance_cents = ? WHERE id = ?",
+                    (balance, acc_id),
+                )
 
-        # 无流水账户余额清零（本轮未触及则保持；底座简化：仅写触及账户）
+        net_total = conn.execute(
+            "SELECT COALESCE(SUM(balance_cents), 0) AS s FROM accounts"
+        ).fetchone()["s"]
         finished = _now()
         conn.execute(
             """
@@ -290,6 +343,7 @@ def run_verify(settle_run_id: int | None = None) -> dict:
         all_ledger_net = all_fwd - all_rev
 
         consistent = 1 if all_ledger_net == all_bal else 0
+        retry_stats = quarantine_retry.stats_for_conn(conn)
         detail = {
             "本轮正向分": fwd_sum,
             "本轮冲正分": rev_sum,
@@ -298,6 +352,12 @@ def run_verify(settle_run_id: int | None = None) -> dict:
             "全量流水净额分": all_ledger_net,
             "全量账户余额分": all_bal,
             "本轮隔离数": q_count,
+            # 重试策略与隔离态、余额同源（同一连接同一快照读出）
+            "隔离冷却中": retry_stats["cooldown_count"],
+            "隔离可重试": retry_stats["ready_count"],
+            "隔离死信": retry_stats["dead_letter_count"],
+            "重试成功数": retry_stats["retry_success_count"],
+            "重试后余额与流水一致": retry_stats["consistent"],
         }
         now = _now()
         cur = conn.execute(

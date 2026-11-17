@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from app.db import FIXTURES_DIR, connect
+from app.modules import quarantine_retry
 
 
 SCHEMA = """
@@ -64,6 +65,8 @@ CREATE TABLE IF NOT EXISTS verify_reports (
 def init_db() -> None:
     with connect() as conn:
         conn.executescript(SCHEMA)
+        quarantine_retry.ensure_schema(conn)
+        quarantine_retry.backfill_state(conn)
         n = conn.execute("SELECT COUNT(*) AS c FROM accounts").fetchone()["c"]
         if n:
             return
